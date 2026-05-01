@@ -1,0 +1,431 @@
+pdf-to-images.ts
+
+// Client-side helpers for processing claim uploads:
+// 1. Rasterize PDF pages to PNG data URLs (using pdfjs)
+// 2. Pass-through for image files
+// 3. Build the page list expected by the extract-claim edge function
+
+import * as pdfjsLib from "pdfjs-dist";
+// @ts-ignore - vite worker import
+import PdfWorker from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+
+if (typeof window !== "undefined") {
+  pdfjsLib.GlobalWorkerOptions.workerSrc = PdfWorker;
+}
+
+export interface ClaimPage {
+  doc_id: string;
+  file_name: string;
+  page: number;
+  image_url: string; // data: URL, sent directly to vision model
+}
+
+async function md5(s: string): Promise<string> {
+  const buf = new TextEncoder().encode(s);
+  const hash = await crypto.subtle.digest("SHA-256", buf);
+  return Array.from(new Uint8Array(hash))
+    .slice(0, 8)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function fileToDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result as string);
+    r.onerror = reject;
+    r.readAsDataURL(file);
+  });
+}
+
+async function pdfToImages(file: File, docId: string): Promise<ClaimPage[]> {
+  const buf = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+  const pages: ClaimPage[] = [];
+
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const viewport = page.getViewport({ scale: 1.6 });
+    const canvas = document.createElement("canvas");
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
+    const ctx = canvas.getContext("2d")!;
+    await page.render({ canvasContext: ctx, viewport, canvas }).promise;
+    pages.push({
+      doc_id: docId,
+      file_name: file.name,
+      page: i,
+      image_url: canvas.toDataURL("image/jpeg", 0.85),
+    });
+  }
+  return pages;
+}
+
+export async function filesToPages(files: File[]): Promise<ClaimPage[]> {
+  const all: ClaimPage[] = [];
+  for (const file of files) {
+    const docId = await md5(`${file.name}_${file.size}`);
+    if (file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf")) {
+      const pages = await pdfToImages(file, docId);
+      all.push(...pages);
+    } else if (file.type.startsWith("image/")) {
+      all.push({
+        doc_id: docId,
+        file_name: file.name,
+        page: 1,
+        image_url: await fileToDataUrl(file),
+      });
+    }
+  }
+  return all;
+}
+
+
+rules-config.ts
+
+// Configurable rules definitions for the claim adjudication engine.
+// Each rule has an id, severity, human description, and a check function
+// that runs against the aggregated claim data.
+
+export type RuleSeverity = "high" | "medium" | "low";
+export type RuleStatus = "pass" | "fail" | "warn";
+
+export interface ExtractedClaim {
+  documents: ClaimDocument[];
+}
+
+export interface ClaimDocument {
+  doc_id: string;
+  file_name: string;
+  page: number;
+  doc_type: string;
+  confidence: number;
+  visual_cues: {
+    hospital_stamp: { present: boolean };
+    doctor_signature: { present: boolean };
+    implant_sticker: { present: boolean; keywords: string[] };
+    qr_barcode: { present: boolean; data: string };
+  };
+  extracted_fields: Record<
+    string,
+    { value: string | number | null; confidence: number; text_span: string }
+  >;
+}
+
+export interface RuleResult {
+  rule_id: string;
+  severity: RuleSeverity;
+  status: RuleStatus;
+  message: string;
+  confidence: number;
+  source_reference: string;
+}
+
+const PROCEDURE_KEYWORDS = [
+  "stent",
+  "angioplasty",
+  "implant",
+  "prosthesis",
+  "graft",
+  "valve",
+];
+
+function parseDate(v: unknown): Date | null {
+  if (!v || typeof v !== "string") return null;
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+function getField(docs: ClaimDocument[], field: string): { value: string; doc: ClaimDocument } | null {
+  let best: { value: string; doc: ClaimDocument; conf: number } | null = null;
+  for (const d of docs) {
+    const f = d.extracted_fields?.[field];
+    if (f && f.value != null && f.value !== "" && f.confidence > (best?.conf ?? 0)) {
+      best = { value: String(f.value), doc: d, conf: f.confidence };
+    }
+  }
+  return best ? { value: best.value, doc: best.doc } : null;
+}
+
+export function runRules(claim: ExtractedClaim): RuleResult[] {
+  const docs = claim.documents ?? [];
+  const results: RuleResult[] = [];
+
+  const admission = getField(docs, "admission_date");
+  const procedure = getField(docs, "procedure_date");
+  const discharge = getField(docs, "discharge_date");
+  const patient = getField(docs, "patient_name");
+  const procName = getField(docs, "procedure");
+
+  // R_CHRONO_001 — admission ≤ procedure
+  {
+    const a = parseDate(admission?.value);
+    const p = parseDate(procedure?.value);
+    if (a && p) {
+      results.push({
+        rule_id: "R_CHRONO_001",
+        severity: "high",
+        status: a.getTime() <= p.getTime() ? "pass" : "fail",
+        message:
+          a.getTime() <= p.getTime()
+            ? `Admission (${admission!.value}) is on or before procedure (${procedure!.value}).`
+            : `Admission (${admission!.value}) is AFTER procedure (${procedure!.value}).`,
+        confidence: 0.95,
+        source_reference: `${admission!.doc.file_name} p.${admission!.doc.page} / ${procedure!.doc.file_name} p.${procedure!.doc.page}`,
+      });
+    } else {
+      results.push({
+        rule_id: "R_CHRONO_001",
+        severity: "high",
+        status: "warn",
+        message: "Cannot verify admission/procedure chronology — one or both dates missing.",
+        confidence: 0.5,
+        source_reference: "—",
+      });
+    }
+  }
+
+  // R_CHRONO_002 — discharge ≥ admission
+  {
+    const a = parseDate(admission?.value);
+    const d = parseDate(discharge?.value);
+    if (a && d) {
+      results.push({
+        rule_id: "R_CHRONO_002",
+        severity: "high",
+        status: d.getTime() >= a.getTime() ? "pass" : "fail",
+        message:
+          d.getTime() >= a.getTime()
+            ? `Discharge (${discharge!.value}) is on or after admission (${admission!.value}).`
+            : `Discharge (${discharge!.value}) is BEFORE admission (${admission!.value}).`,
+        confidence: 0.95,
+        source_reference: `${admission!.doc.file_name} / ${discharge!.doc.file_name}`,
+      });
+    } else {
+      results.push({
+        rule_id: "R_CHRONO_002",
+        severity: "high",
+        status: "warn",
+        message: "Cannot verify discharge/admission chronology — date(s) missing.",
+        confidence: 0.5,
+        source_reference: "—",
+      });
+    }
+  }
+
+  // R_DOC_001 — at least one clinical document
+  {
+    const has = docs.some((d) =>
+      ["discharge_summary", "clinical_note", "angioplasty_report"].includes(d.doc_type),
+    );
+    results.push({
+      rule_id: "R_DOC_001",
+      severity: "high",
+      status: has ? "pass" : "fail",
+      message: has
+        ? "At least one clinical document is present."
+        : "No clinical document (discharge summary / clinical note / procedure report) found.",
+      confidence: 0.9,
+      source_reference: docs
+        .filter((d) =>
+          ["discharge_summary", "clinical_note", "angioplasty_report"].includes(d.doc_type),
+        )
+        .map((d) => d.file_name)
+        .join(", ") || "—",
+    });
+  }
+
+  // R_DIAG_001 — diagnostic doc when procedure present
+  {
+    if (procName?.value) {
+      const hasDiag = docs.some((d) =>
+        ["lab_report", "xray", "ct_scan"].includes(d.doc_type),
+      );
+      results.push({
+        rule_id: "R_DIAG_001",
+        severity: "medium",
+        status: hasDiag ? "pass" : "fail",
+        message: hasDiag
+          ? "Diagnostic investigation document is present."
+          : `Procedure "${procName.value}" found but no diagnostic document (lab/x-ray/CT) attached.`,
+        confidence: 0.85,
+        source_reference: procName.doc.file_name,
+      });
+    }
+  }
+
+  // R_LOS_001 — length of stay ≥ 0
+  {
+    const a = parseDate(admission?.value);
+    const d = parseDate(discharge?.value);
+    if (a && d) {
+      const days = Math.round((d.getTime() - a.getTime()) / 86400000);
+      results.push({
+        rule_id: "R_LOS_001",
+        severity: "high",
+        status: days >= 0 ? "pass" : "fail",
+        message: `Length of stay = ${days} day(s).`,
+        confidence: 0.95,
+        source_reference: `${admission!.doc.file_name} / ${discharge!.doc.file_name}`,
+      });
+
+      // R_LOS_002 / R_LOS_003
+      if (days === 0) {
+        results.push({
+          rule_id: "R_LOS_002",
+          severity: "medium",
+          status: "warn",
+          message: "Zero-day stay — verify day-care/OPD package.",
+          confidence: 0.8,
+          source_reference: `${admission!.doc.file_name}`,
+        });
+      } else if (days > 30) {
+        results.push({
+          rule_id: "R_LOS_003",
+          severity: "medium",
+          status: "warn",
+          message: `Stay of ${days} days exceeds 30 — verify medical necessity.`,
+          confidence: 0.8,
+          source_reference: `${admission!.doc.file_name}`,
+        });
+      }
+    }
+  }
+
+  // R_AUTH_001 — doctor signature on a clinical doc
+  {
+    const clinical = docs.filter((d) =>
+      ["discharge_summary", "clinical_note", "angioplasty_report"].includes(d.doc_type),
+    );
+    if (clinical.length) {
+      const signed = clinical.some((d) => d.visual_cues?.doctor_signature?.present);
+      results.push({
+        rule_id: "R_AUTH_001",
+        severity: "low",
+        status: signed ? "pass" : "warn",
+        message: signed
+          ? "Doctor signature detected on clinical document(s)."
+          : "No doctor signature detected on clinical document(s).",
+        confidence: 0.7,
+        source_reference: clinical.map((d) => d.file_name).join(", "),
+      });
+    }
+  }
+
+  // R_IMPLANT_001 — implant sticker for stent/implant procedures
+  {
+    const procVal = (procName?.value ?? "").toLowerCase();
+    const isImplant = PROCEDURE_KEYWORDS.some((k) => procVal.includes(k));
+    if (isImplant) {
+      const hasSticker = docs.some((d) => d.visual_cues?.implant_sticker?.present);
+      results.push({
+        rule_id: "R_IMPLANT_001",
+        severity: "medium",
+        status: hasSticker ? "pass" : "fail",
+        message: hasSticker
+          ? "Implant sticker / batch info detected."
+          : `Procedure "${procName!.value}" requires an implant sticker / batch info — not found.`,
+        confidence: 0.8,
+        source_reference: procName!.doc.file_name,
+      });
+    }
+  }
+
+  // R_KIE_001 — patient name extractable
+  results.push({
+    rule_id: "R_KIE_001",
+    severity: "high",
+    status: patient ? "pass" : "fail",
+    message: patient
+      ? `Patient name extracted: "${patient.value}".`
+      : "Patient name could not be extracted from any document.",
+    confidence: patient ? 0.9 : 0.6,
+    source_reference: patient ? `${patient.doc.file_name} p.${patient.doc.page}` : "—",
+  });
+
+  return results;
+}
+
+export function decide(rules: RuleResult[]): {
+  status: "Pass" | "Conditional" | "Fail";
+  confidence: number;
+  score: number;
+} {
+  let score = 0;
+  let highFail = false;
+  for (const r of rules) {
+    if (r.status === "fail" && r.severity === "high") {
+      highFail = true;
+      score += 3;
+    } else if (r.status === "fail") {
+      score += 2;
+    } else if (r.status === "warn") {
+      score += 1;
+    }
+  }
+  const status = highFail ? "Fail" : score >= 2 ? "Conditional" : "Pass";
+  const passed = rules.filter((r) => r.status === "pass").length;
+  const confidence = rules.length ? passed / rules.length : 0;
+  return { status, confidence, score };
+}
+
+export function buildTimeline(docs: ClaimDocument[]) {
+  const events: {
+    sequence: number;
+    event_type: string;
+    date_value: string;
+    source_document: string;
+    temporal_validity: string;
+  }[] = [];
+
+  const fields: { event: string; field: string }[] = [
+    { event: "Admission", field: "admission_date" },
+    { event: "Diagnostic Investigation", field: "investigation_date" },
+    { event: "Procedure", field: "procedure_date" },
+    { event: "Discharge", field: "discharge_date" },
+  ];
+
+  for (const { event, field } of fields) {
+    const found = getField(docs, field);
+    if (found) {
+      events.push({
+        sequence: 0,
+        event_type: event,
+        date_value: found.value,
+        source_document: `${found.doc.file_name} (p.${found.doc.page})`,
+        temporal_validity: parseDate(found.value) ? "Valid" : "Date missing",
+      });
+    }
+  }
+
+  events.sort((a, b) => {
+    const da = parseDate(a.date_value)?.getTime() ?? 0;
+    const db = parseDate(b.date_value)?.getTime() ?? 0;
+    return da - db;
+  });
+  events.forEach((e, i) => (e.sequence = i + 1));
+
+  // Mark invalid orderings
+  const adm = events.find((e) => e.event_type === "Admission");
+  const proc = events.find((e) => e.event_type === "Procedure");
+  if (adm && proc) {
+    const da = parseDate(adm.date_value);
+    const dp = parseDate(proc.date_value);
+    if (da && dp && da.getTime() > dp.getTime()) {
+      adm.temporal_validity = "Invalid: Admission after procedure";
+    }
+  }
+
+  return events;
+}
+
+utils.ts
+
+import { clsx, type ClassValue } from "clsx";
+import { twMerge } from "tailwind-merge";
+
+export function cn(...inputs: ClassValue[]) {
+  return twMerge(clsx(inputs));
+}
+
+

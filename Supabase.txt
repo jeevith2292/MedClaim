@@ -1,0 +1,616 @@
+// Streaming chatbot answering questions about a specific claim.
+// The full claim JSON is injected as system context every call.
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type",
+};
+
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
+
+  try {
+    const apiKey = Deno.env.get("LOVABLE_API_KEY");
+    if (!apiKey) throw new Error("LOVABLE_API_KEY not configured");
+
+    const { messages, claim } = await req.json();
+
+    const systemPrompt = `You are a medical claim adjudication assistant.
+Answer ONLY from the provided claim data below. Do not hallucinate or invent values.
+If information is not in the claim data, clearly say so.
+Cite source documents and page numbers when relevant.
+
+CLAIM DATA (JSON):
+${JSON.stringify(claim, null, 2)}`;
+
+    const upstream = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "google/gemini-2.5-flash",
+        messages: [{ role: "system", content: systemPrompt }, ...messages],
+        stream: true,
+      }),
+    });
+
+    if (!upstream.ok) {
+      if (upstream.status === 429) {
+        return new Response(JSON.stringify({ error: "Rate limit. Try again shortly." }), {
+          status: 429,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      if (upstream.status === 402) {
+        return new Response(JSON.stringify({ error: "AI credits exhausted. Add credits in Settings → Workspace → Usage." }), {
+          status: 402,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      const t = await upstream.text();
+      return new Response(JSON.stringify({ error: t }), {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    return new Response(upstream.body, {
+      headers: { ...corsHeaders, "Content-Type": "text/event-stream" },
+    });
+  } catch (e) {
+    console.error("claim-chat error:", e);
+    return new Response(
+      JSON.stringify({ error: e instanceof Error ? e.message : "Unknown error" }),
+      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+    );
+  }
+});
+
+index.ts
+
+// Edge function: extracts structured fields from claim document images using
+// the Lovable AI Gateway (Gemini vision). Accepts an array of {file_name, url}
+// where url is a publicly accessible image (PNG/JPG). Returns the documents
+// array matching our claim schema.
+//
+// PDFs should be rasterized to images on the client before calling this.
+
+import "https://deno.land/x/xhr@0.1.0/mod.ts";
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type",
+};
+
+interface PageInput {
+  doc_id: string;
+  file_name: string;
+  page: number;
+  image_url: string; // public URL or data: URL
+}
+
+const SYSTEM_PROMPT = `You are a medical claim document extraction engine.
+You will receive ONE image of a single page from a healthcare claim packet
+(could be a discharge summary, clinical note, procedure/angioplasty report,
+lab report, X-ray, CT scan, invoice, prescription, or a patient photo).
+
+Your job is to:
+1. Classify the document type.
+2. Extract all available fields with provenance.
+3. Detect visual cues (hospital stamp, doctor signature, implant sticker, QR/barcode).
+
+Be conservative. If a value is not clearly present, return null with low confidence.
+Never invent values. Dates must be ISO format YYYY-MM-DD when possible.`;
+
+const EXTRACTION_TOOL = {
+  type: "function",
+  function: {
+    name: "extract_document",
+    description: "Extract structured data from one claim document page.",
+    parameters: {
+      type: "object",
+      properties: {
+        doc_type: {
+          type: "string",
+          enum: [
+            "discharge_summary",
+            "clinical_note",
+            "angioplasty_report",
+            "lab_report",
+            "xray",
+            "ct_scan",
+            "invoice",
+            "prescription",
+            "patient_photo",
+            "unknown",
+          ],
+        },
+        confidence: { type: "number" },
+        visual_cues: {
+          type: "object",
+          properties: {
+            hospital_stamp_present: { type: "boolean" },
+            doctor_signature_present: { type: "boolean" },
+            implant_sticker_present: { type: "boolean" },
+            implant_sticker_keywords: {
+              type: "array",
+              items: { type: "string" },
+            },
+            qr_barcode_present: { type: "boolean" },
+            qr_barcode_data: { type: "string" },
+          },
+          required: [
+            "hospital_stamp_present",
+            "doctor_signature_present",
+            "implant_sticker_present",
+            "implant_sticker_keywords",
+            "qr_barcode_present",
+            "qr_barcode_data",
+          ],
+        },
+        fields: {
+          type: "object",
+          properties: {
+            patient_name: { type: "object", properties: { value: { type: "string" }, confidence: { type: "number" }, text_span: { type: "string" } }, required: ["value", "confidence", "text_span"] },
+            diagnosis: { type: "object", properties: { value: { type: "string" }, confidence: { type: "number" }, text_span: { type: "string" } }, required: ["value", "confidence", "text_span"] },
+            procedure: { type: "object", properties: { value: { type: "string" }, confidence: { type: "number" }, text_span: { type: "string" } }, required: ["value", "confidence", "text_span"] },
+            admission_date: { type: "object", properties: { value: { type: "string" }, confidence: { type: "number" }, text_span: { type: "string" } }, required: ["value", "confidence", "text_span"] },
+            procedure_date: { type: "object", properties: { value: { type: "string" }, confidence: { type: "number" }, text_span: { type: "string" } }, required: ["value", "confidence", "text_span"] },
+            discharge_date: { type: "object", properties: { value: { type: "string" }, confidence: { type: "number" }, text_span: { type: "string" } }, required: ["value", "confidence", "text_span"] },
+            investigation_date: { type: "object", properties: { value: { type: "string" }, confidence: { type: "number" }, text_span: { type: "string" } }, required: ["value", "confidence", "text_span"] },
+            total_amount: { type: "object", properties: { value: { type: "string" }, confidence: { type: "number" }, text_span: { type: "string" } }, required: ["value", "confidence", "text_span"] },
+          },
+        },
+      },
+      required: ["doc_type", "confidence", "visual_cues", "fields"],
+    },
+  },
+};
+
+async function extractOne(page: PageInput, apiKey: string) {
+  const resp = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "google/gemini-2.5-flash",
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: `Extract data from this page (file: ${page.file_name}, page ${page.page}).` },
+            { type: "image_url", image_url: { url: page.image_url } },
+          ],
+        },
+      ],
+      tools: [EXTRACTION_TOOL],
+      tool_choice: { type: "function", function: { name: "extract_document" } },
+    }),
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`AI gateway ${resp.status}: ${text}`);
+  }
+
+  const json = await resp.json();
+  const call = json.choices?.[0]?.message?.tool_calls?.[0];
+  if (!call) throw new Error("No tool call in response");
+  const args = JSON.parse(call.function.arguments);
+
+  return {
+    doc_id: page.doc_id,
+    file_name: page.file_name,
+    page: page.page,
+    doc_type: args.doc_type,
+    confidence: args.confidence,
+    visual_cues: {
+      hospital_stamp: { present: args.visual_cues.hospital_stamp_present, bbox: [] },
+      doctor_signature: { present: args.visual_cues.doctor_signature_present, bbox: [] },
+      implant_sticker: {
+        present: args.visual_cues.implant_sticker_present,
+        keywords: args.visual_cues.implant_sticker_keywords ?? [],
+      },
+      qr_barcode: {
+        present: args.visual_cues.qr_barcode_present,
+        data: args.visual_cues.qr_barcode_data ?? "",
+      },
+    },
+    extracted_fields: args.fields ?? {},
+    issues: [],
+  };
+}
+
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
+
+  try {
+    const apiKey = Deno.env.get("LOVABLE_API_KEY");
+    if (!apiKey) throw new Error("LOVABLE_API_KEY not configured");
+
+    const { pages } = (await req.json()) as { pages: PageInput[] };
+    if (!Array.isArray(pages) || pages.length === 0) {
+      return new Response(JSON.stringify({ error: "pages[] required" }), {
+        status: 400,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    // Process pages sequentially to avoid rate limits
+    const documents = [];
+    for (const page of pages) {
+      try {
+        const doc = await extractOne(page, apiKey);
+        documents.push(doc);
+      } catch (e) {
+        console.error("extract error for", page.file_name, e);
+        documents.push({
+          doc_id: page.doc_id,
+          file_name: page.file_name,
+          page: page.page,
+          doc_type: "unknown",
+          confidence: 0,
+          visual_cues: {
+            hospital_stamp: { present: false, bbox: [] },
+            doctor_signature: { present: false, bbox: [] },
+            implant_sticker: { present: false, keywords: [] },
+            qr_barcode: { present: false, data: "" },
+          },
+          extracted_fields: {},
+          issues: [`extraction_failed: ${e instanceof Error ? e.message : String(e)}`],
+        });
+      }
+    }
+
+    return new Response(JSON.stringify({ documents }), {
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  } catch (e) {
+    console.error("extract-claim error:", e);
+    const msg = e instanceof Error ? e.message : "Unknown error";
+    const status = msg.includes("429") ? 429 : msg.includes("402") ? 402 : 500;
+    return new Response(JSON.stringify({ error: msg }), {
+      status,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  }
+});
+
+20260430174341_a8661a82-0473-490c
+
+-- Storage bucket for uploaded claim files
+INSERT INTO storage.buckets (id, name, public)
+VALUES ('claim-files', 'claim-files', true)
+ON CONFLICT (id) DO NOTHING;
+
+-- Public read on the bucket
+CREATE POLICY "Public read claim-files"
+ON storage.objects FOR SELECT
+USING (bucket_id = 'claim-files');
+
+CREATE POLICY "Public upload claim-files"
+ON storage.objects FOR INSERT
+WITH CHECK (bucket_id = 'claim-files');
+
+-- Claims table
+CREATE TABLE public.claims (
+  id UUID NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
+  status TEXT NOT NULL DEFAULT 'processing',
+  file_names TEXT[] NOT NULL DEFAULT '{}',
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+ALTER TABLE public.claims ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Public read claims" ON public.claims FOR SELECT USING (true);
+CREATE POLICY "Public insert claims" ON public.claims FOR INSERT WITH CHECK (true);
+CREATE POLICY "Public update claims" ON public.claims FOR UPDATE USING (true);
+
+-- Chat messages
+CREATE TABLE public.chat_messages (
+  id UUID NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
+  claim_id UUID NOT NULL REFERENCES public.claims(id) ON DELETE CASCADE,
+  role TEXT NOT NULL,
+  content TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+ALTER TABLE public.chat_messages ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Public read chat" ON public.chat_messages FOR SELECT USING (true);
+CREATE POLICY "Public insert chat" ON public.chat_messages FOR INSERT WITH CHECK (true);
+
+CREATE INDEX idx_chat_messages_claim ON public.chat_messages(claim_id, created_at);
+CREATE INDEX idx_claims_created ON public.claims(created_at DESC);
+
+config.toml
+
+project_id = "jezqplaumlrhvsyamelz"
+
+[functions.extract-claim]
+verify_jwt = false
+
+[functions.claim-chat]
+verify_jwt = false
+
+.env
+SUPABASE_PUBLISHABLE_KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImplenFwbGF1bWxyaHZzeWFtZWx6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc1NjE5NTUsImV4cCI6MjA5MzEzNzk1NX0.wdSt49hw9M7lhONHPX3TAzTBYkqPwazLDluGjRrRGQo"
+SUPABASE_URL="https://jezqplaumlrhvsyamelz.supabase.co"
+VITE_SUPABASE_PROJECT_ID="jezqplaumlrhvsyamelz"
+VITE_SUPABASE_PUBLISHABLE_KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImplenFwbGF1bWxyaHZzeWFtZWx6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc1NjE5NTUsImV4cCI6MjA5MzEzNzk1NX0.wdSt49hw9M7lhONHPX3TAzTBYkqPwazLDluGjRrRGQo"
+VITE_SUPABASE_URL="https://jezqplaumlrhvsyamelz.supabase.co"
+
+
+.gitignore
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+.output
+.vinxi
+.tanstack/**
+.nitro
+*.local
+
+# Wrangler / Cloudflare
+.wrangler/
+.dev.vars
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+.prettierignore
+
+node_modules
+dist
+.output
+.vinxi
+pnpm-lock.yaml
+package-lock.json
+routeTree.gen.ts
+
+.prettierrc
+
+{
+  "printWidth": 100,
+  "semi": true,
+  "singleQuote": false,
+  "trailingComma": "all"
+}
+
+
+bunfig.toml
+
+[install]
+saveTextLockfile = false
+
+components.json
+
+{
+  "$schema": "https://ui.shadcn.com/schema.json",
+  "style": "new-york",
+  "rsc": false,
+  "tsx": true,
+  "tailwind": {
+    "css": "src/styles.css",
+    "baseColor": "slate",
+    "cssVariables": true,
+    "prefix": ""
+  },
+  "iconLibrary": "lucide",
+  "rtl": false,
+  "aliases": {
+    "components": "@/components",
+    "utils": "@/lib/utils",
+    "ui": "@/components/ui",
+    "lib": "@/lib",
+    "hooks": "@/hooks"
+  },
+  "registries": {}
+}
+
+
+eslint.config.js
+
+
+import js from "@eslint/js";
+import eslintPluginPrettier from "eslint-plugin-prettier/recommended";
+import globals from "globals";
+import reactHooks from "eslint-plugin-react-hooks";
+import reactRefresh from "eslint-plugin-react-refresh";
+import tseslint from "typescript-eslint";
+
+export default tseslint.config(
+  { ignores: ["dist", ".output", ".vinxi"] },
+  {
+    extends: [js.configs.recommended, ...tseslint.configs.recommended],
+    files: ["**/*.{ts,tsx}"],
+    languageOptions: {
+      ecmaVersion: 2020,
+      globals: globals.browser,
+    },
+    plugins: {
+      "react-hooks": reactHooks,
+      "react-refresh": reactRefresh,
+    },
+    rules: {
+      ...reactHooks.configs.recommended.rules,
+      "react-refresh/only-export-components": ["warn", { allowConstantExport: true }],
+      "@typescript-eslint/no-unused-vars": "off",
+    },
+  },
+  eslintPluginPrettier,
+);
+
+package.json
+
+{
+  "name": "tanstack_start_ts",
+  "private": true,
+  "sideEffects": false,
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev",
+    "build": "vite build",
+    "build:dev": "vite build --mode development",
+    "preview": "vite preview",
+    "lint": "eslint .",
+    "format": "prettier --write ."
+  },
+  "dependencies": {
+    "@cloudflare/vite-plugin": "^1.25.5",
+    "@hookform/resolvers": "^5.2.2",
+    "@radix-ui/react-accordion": "^1.2.12",
+    "@radix-ui/react-alert-dialog": "^1.1.15",
+    "@radix-ui/react-aspect-ratio": "^1.1.8",
+    "@radix-ui/react-avatar": "^1.1.11",
+    "@radix-ui/react-checkbox": "^1.3.3",
+    "@radix-ui/react-collapsible": "^1.1.12",
+    "@radix-ui/react-context-menu": "^2.2.16",
+    "@radix-ui/react-dialog": "^1.1.15",
+    "@radix-ui/react-dropdown-menu": "^2.1.16",
+    "@radix-ui/react-hover-card": "^1.1.15",
+    "@radix-ui/react-label": "^2.1.8",
+    "@radix-ui/react-menubar": "^1.1.16",
+    "@radix-ui/react-navigation-menu": "^1.2.14",
+    "@radix-ui/react-popover": "^1.1.15",
+    "@radix-ui/react-progress": "^1.1.8",
+    "@radix-ui/react-radio-group": "^1.3.8",
+    "@radix-ui/react-scroll-area": "^1.2.10",
+    "@radix-ui/react-select": "^2.2.6",
+    "@radix-ui/react-separator": "^1.1.8",
+    "@radix-ui/react-slider": "^1.3.6",
+    "@radix-ui/react-slot": "^1.2.4",
+    "@radix-ui/react-switch": "^1.2.6",
+    "@radix-ui/react-tabs": "^1.1.13",
+    "@radix-ui/react-toggle": "^1.1.10",
+    "@radix-ui/react-toggle-group": "^1.1.11",
+    "@radix-ui/react-tooltip": "^1.2.8",
+    "@supabase/supabase-js": "^2.105.1",
+    "@tailwindcss/vite": "^4.2.1",
+    "@tanstack/react-query": "^5.83.0",
+    "@tanstack/react-router": "^1.168.0",
+    "@tanstack/react-start": "^1.167.14",
+    "@tanstack/router-plugin": "^1.167.10",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "cmdk": "^1.1.1",
+    "date-fns": "^4.1.0",
+    "embla-carousel-react": "^8.6.0",
+    "input-otp": "^1.4.2",
+    "lucide-react": "^0.575.0",
+    "pdfjs-dist": "^5.7.284",
+    "react": "^19.2.0",
+    "react-day-picker": "^9.14.0",
+    "react-dom": "^19.2.0",
+    "react-hook-form": "^7.71.2",
+    "react-markdown": "^10.1.0",
+    "react-resizable-panels": "^4.6.5",
+    "recharts": "^2.15.4",
+    "sonner": "^2.0.7",
+    "tailwind-merge": "^3.5.0",
+    "tailwindcss": "^4.2.1",
+    "tw-animate-css": "^1.3.4",
+    "vaul": "^1.1.2",
+    "vite-tsconfig-paths": "^6.0.2",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.32.0",
+    "@lovable.dev/vite-tanstack-config": "^1.4.0",
+    "@types/node": "^22.16.5",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.0.4",
+    "eslint": "^9.32.0",
+    "eslint-config-prettier": "^10.1.1",
+    "eslint-plugin-prettier": "^5.2.6",
+    "eslint-plugin-react-hooks": "^5.2.0",
+    "eslint-plugin-react-refresh": "^0.4.20",
+    "globals": "^15.15.0",
+    "prettier": "^3.7.3",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.56.1",
+    "vite": "^7.3.1"
+  }
+}
+
+
+tsconfig.json
+
+{
+  "include": ["src/**/*.ts", "src/**/*.tsx", "vite.config.ts", "eslint.config.js"],
+  "compilerOptions": {
+    "target": "ES2022",
+    "jsx": "react-jsx",
+    "module": "ESNext",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["vite/client"],
+
+    /* Bundler mode */
+    "moduleResolution": "Bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": false,
+    "noEmit": true,
+
+    /* Linting */
+    "skipLibCheck": true,
+    "strict": true,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedSideEffectImports": true,
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  }
+}
+
+
+vite.config.ts
+
+// @lovable.dev/vite-tanstack-config already includes the following — do NOT add them manually
+// or the app will break with duplicate plugins:
+//   - tanstackStart, viteReact, tailwindcss, tsConfigPaths, cloudflare (build-only),
+//     componentTagger (dev-only), VITE_* env injection, @ path alias, React/TanStack dedupe,
+//     error logger plugins, and sandbox detection (port/host/strictPort).
+// You can pass additional config via defineConfig({ vite: { ... } }) if needed.
+import { defineConfig } from "@lovable.dev/vite-tanstack-config";
+
+export default defineConfig();
+
+wrangler.jsonc
+
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "tanstack-start-app",
+  "compatibility_date": "2025-09-24",
+  "compatibility_flags": ["nodejs_compat"],
+  "main": "@tanstack/react-start/server-entry",
+}
